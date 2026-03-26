@@ -26,24 +26,27 @@ Create instance configs:
 
 ## Usage (manual)
 ```bash
-sudo ./mtail setup --instance work
-sudo ./mtail run --instance work
+sudo ./mtail setup work
+sudo ./mtail run work
 ```
 In another terminal, log in once:
 ```bash
-sudo ./mtail login --instance work
+sudo ./mtail login work
 ```
 
 Shortcut (background run):
 ```bash
-sudo ./mtail up --instance work
-sudo ./mtail login --instance work
+sudo ./mtail up work
+sudo ./mtail login work
 ```
 
 To stop and clean up:
 ```bash
-sudo ./mtail down --instance work
+sudo ./mtail down work
 ```
+
+`mtail up/down` use systemd template units under the hood. If your host
+does not use systemd, use the manual `setup/run/down` commands instead.
 
 ## systemd (recommended)
 Helper install script:
@@ -69,28 +72,26 @@ sudo systemctl daemon-reload
 This runs two independent tailnets (`work` and `personal`) with identical UX.
 ```bash
 sudo ./install.sh
-sudo cp /etc/multi-tailnet/config.sh /etc/multi-tailnet/instances/work.conf
-sudo cp /etc/multi-tailnet/config.sh /etc/multi-tailnet/instances/personal.conf
+sudo mtail create work
+sudo mtail create personal
 sudo $EDITOR /etc/multi-tailnet/instances/work.conf
 sudo $EDITOR /etc/multi-tailnet/instances/personal.conf
 
-sudo systemctl enable --now mtail-setup@work.service
-sudo systemctl enable --now mtail@work.service
-sudo systemctl enable --now mtail-setup@personal.service
-sudo systemctl enable --now mtail@personal.service
+sudo mtail up work
+sudo mtail up personal
 
-sudo mtail login --instance work
-sudo mtail login --instance personal
+sudo mtail login work
+sudo mtail login personal
 ```
 Status:
 ```bash
-tailscale --socket /run/mtail/work/tailscaled.sock status
-tailscale --socket /run/mtail/personal/tailscaled.sock status
+sudo mtail status work
+sudo mtail status personal
 ```
 Stop and cleanup per instance:
 ```bash
-sudo systemctl stop mtail@work.service
-sudo systemctl stop mtail@personal.service
+sudo mtail down work
+sudo mtail down personal
 ```
 
 ## Firewall backends

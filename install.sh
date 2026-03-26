@@ -45,10 +45,9 @@ Installed:
 
 Next steps:
 1) Create instance config (replace work):
-  sudo cp ${CONFIG_DIR}/config.sh ${INSTANCES_DIR}/work.conf
-2) Enable services:
-  sudo systemctl enable --now mtail-setup@work.service
-  sudo systemctl enable --now mtail@work.service
+  sudo ${INSTALL_BIN} create work
+2) Start:
+  sudo ${INSTALL_BIN} up work
 3) Login:
-  sudo ${INSTALL_BIN} login --instance work
+  sudo ${INSTALL_BIN} login work
 EOF_MSG

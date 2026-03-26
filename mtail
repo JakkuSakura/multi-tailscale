@@ -12,16 +12,17 @@ usage() {
 mtail: manage multiple Tailscale instances via network namespaces
 
 Usage:
-  mtail <command> [--instance NAME] [--config PATH] [--force]
+  mtail <command> [INSTANCE] [--config PATH] [--force]
+  mtail <command> --instance NAME [--config PATH] [--force]
 
 Commands:
-  init            Create a new instance config from template.
-  setup           Create netns, veth, routes, dns, firewall.
-  run             Run tailscaled in foreground for the instance.
-  up              Setup + run tailscaled in background.
-  down            Stop tailscaled and remove netns/routes/firewall.
+  create          Create a new instance config from template.
+  up              Enable/start systemd units for the instance.
+  down            Stop systemd units and cleanup instance.
   login           Login the instance to a tailnet.
   status          Show tailscale status for the instance.
+  setup           Create netns, veth, routes, dns, firewall.
+  run             Run tailscaled in foreground for the instance.
   list            List known instance configs.
   show-config     Print resolved config.
   logs            Tail instance log file.
@@ -32,7 +33,7 @@ Commands:
 Options:
   --instance NAME Instance name (required for most commands).
   --config PATH   Config file path override.
-  --force         Overwrite config on init.
+  --force         Overwrite config on create.
 EOF
 }
 
@@ -54,6 +55,7 @@ parse_args() {
   COMMAND="$1"
   shift
 
+  local positional_instance=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --instance)
@@ -73,12 +75,21 @@ parse_args() {
         exit 0
         ;;
       *)
-        echo "mtail: unknown option: $1" >&2
-        usage
-        exit 1
+        if [[ -z "${positional_instance}" ]]; then
+          positional_instance="$1"
+          shift
+        else
+          echo "mtail: unexpected argument: $1" >&2
+          usage
+          exit 1
+        fi
         ;;
     esac
   done
+
+  if [[ -z "${INSTANCE}" && -n "${positional_instance}" ]]; then
+    INSTANCE="${positional_instance}"
+  fi
 }
 
 instance_required() {
@@ -89,7 +100,7 @@ instance_required() {
   esac
 
   if [[ -z "${INSTANCE}" ]]; then
-    echo "mtail: --instance is required for ${COMMAND}" >&2
+    echo "mtail: instance is required for ${COMMAND}" >&2
     exit 1
   fi
 }
@@ -446,7 +457,7 @@ teardown() {
   rmdir "${RUN_DIR}" 2>/dev/null || true
 }
 
-cmd_init() {
+cmd_create() {
   require_root
   instance_required
   local target="${CONFIG_FILE:-/etc/multi-tailnet/instances/${INSTANCE}.conf}"
@@ -476,14 +487,15 @@ cmd_run() {
 
 cmd_up() {
   require_root
-  cmd_setup
-  start_tailscaled_background
-  echo "mtail: instance started. Run: mtail login --instance ${INSTANCE}"
+  systemctl enable --now "mtail-setup@${INSTANCE}.service"
+  systemctl enable --now "mtail@${INSTANCE}.service"
+  echo "mtail: instance started. Run: mtail login ${INSTANCE}"
 }
 
 cmd_down() {
   require_root
-  teardown
+  systemctl stop "mtail@${INSTANCE}.service" || true
+  systemctl stop "mtail-setup@${INSTANCE}.service" || true
 }
 
 cmd_login() {
@@ -549,7 +561,7 @@ main() {
   apply_defaults
 
   case "${COMMAND}" in
-    init) cmd_init ;;
+    create) cmd_create ;;
     setup) cmd_setup ;;
     run) cmd_run ;;
     up) cmd_up ;;
