@@ -1,11 +1,11 @@
 # multi-tailscale
 
-Run a second Tailscale daemon on Linux in a separate network namespace so one machine can reach two tailnets simultaneously. This mirrors the approach described by James Guthrie, but packages it as a single script with systemd units.
+Run additional Tailscale daemons on Linux in separate network namespaces so one machine can reach multiple tailnets simultaneously. This mirrors the approach described by James Guthrie, but packages it as a single CLI with systemd units.
 
 ## What this does
-- Creates a dedicated netns (`tailns`) and veth pair
-- Starts a second `tailscaled` inside the netns with separate state/socket
-- Routes selected subnets from the second tailnet through the namespace
+- Creates a dedicated netns and veth pair per instance
+- Starts a separate `tailscaled` inside each netns with its own state/socket
+- Routes selected subnets from the tailnet instance through the namespace
 - Adds NAT and forwarding rules via iptables, nftables, or ufw
 - Optional per-namespace DNS config
 
@@ -17,37 +17,32 @@ Run a second Tailscale daemon on Linux in a separate network namespace so one ma
 - Root privileges
 
 ## Configure
-Edit `config.sh`:
+Create instance configs:
 - `HOST_IFACE` (your Internet-facing interface)
-- `WORK_SUBNETS` (subnets you need via the second tailnet)
+- `WORK_SUBNETS` (subnets you need via the instance tailnet)
 - `FIREWALL` (`auto`, `iptables`, `nftables`, `ufw`)
 - `DNS_SERVERS` (optional; if set, writes `/etc/netns/<ns>/resolv.conf`)
 - Optional: veth IPs and namespace name
 
-You can also override the config file path:
-```bash
-MULTI_TAILNET_CONFIG=/etc/multi-tailnet/config.sh
-```
-
 ## Usage (manual)
 ```bash
-sudo ./multi-tailnet.sh setup
-sudo ./multi-tailnet.sh run
+sudo ./mtail setup --instance work
+sudo ./mtail run --instance work
 ```
 In another terminal, log in once:
 ```bash
-sudo ./multi-tailnet.sh login
+sudo ./mtail login --instance work
 ```
 
 Shortcut (background run):
 ```bash
-sudo ./multi-tailnet.sh up
-sudo ./multi-tailnet.sh login
+sudo ./mtail up --instance work
+sudo ./mtail login --instance work
 ```
 
 To stop and clean up:
 ```bash
-sudo ./multi-tailnet.sh down
+sudo ./mtail down --instance work
 ```
 
 ## systemd (recommended)
@@ -58,36 +53,49 @@ sudo ./install.sh
 
 Or manually:
 ```bash
-sudo install -m 0755 multi-tailnet.sh /usr/local/bin/multi-tailnet.sh
+sudo install -m 0755 mtail /usr/local/bin/mtail
 sudo install -d /etc/multi-tailnet
 sudo install -m 0644 config.sh /etc/multi-tailnet/config.sh
-```
-Set config path for systemd (drop-in or env):
-```bash
-sudo systemctl edit multi-tailnet.service
-```
-Add:
-```ini
-[Service]
-Environment="MULTI_TAILNET_CONFIG=/etc/multi-tailnet/config.sh"
 ```
 
 Install units:
 ```bash
-sudo install -m 0644 systemd/multi-tailnet-setup.service /etc/systemd/system/multi-tailnet-setup.service
-sudo install -m 0644 systemd/multi-tailnet.service /etc/systemd/system/multi-tailnet.service
+sudo install -m 0644 systemd/mtail-setup@.service /etc/systemd/system/mtail-setup@.service
+sudo install -m 0644 systemd/mtail@.service /etc/systemd/system/mtail@.service
 sudo systemctl daemon-reload
-sudo systemctl enable --now multi-tailnet-setup.service
-sudo systemctl enable --now multi-tailnet.service
 ```
-Log in once:
+
+### Two equal instances (quickstart)
+This runs two independent tailnets (`work` and `personal`) with identical UX.
 ```bash
-sudo /usr/local/bin/multi-tailnet.sh login
+sudo ./install.sh
+sudo cp /etc/multi-tailnet/config.sh /etc/multi-tailnet/instances/work.conf
+sudo cp /etc/multi-tailnet/config.sh /etc/multi-tailnet/instances/personal.conf
+sudo $EDITOR /etc/multi-tailnet/instances/work.conf
+sudo $EDITOR /etc/multi-tailnet/instances/personal.conf
+
+sudo systemctl enable --now mtail-setup@work.service
+sudo systemctl enable --now mtail@work.service
+sudo systemctl enable --now mtail-setup@personal.service
+sudo systemctl enable --now mtail@personal.service
+
+sudo mtail login --instance work
+sudo mtail login --instance personal
+```
+Status:
+```bash
+tailscale --socket /run/mtail/work/tailscaled.sock status
+tailscale --socket /run/mtail/personal/tailscaled.sock status
+```
+Stop and cleanup per instance:
+```bash
+sudo systemctl stop mtail@work.service
+sudo systemctl stop mtail@personal.service
 ```
 
 ## Firewall backends
 - `auto` picks `ufw` if active, otherwise `nftables`, otherwise `iptables`.
-- `ufw` backend adds route rules and inserts a MASQUERADE rule into `/etc/ufw/before.rules` under a `# multi-tailnet` marker block. It reloads ufw. Review that file if you have custom policies.
+- `ufw` backend adds route rules and inserts a MASQUERADE rule into `/etc/ufw/before.rules` under a `# mtail` marker block. It reloads ufw. Review that file if you have custom policies.
 
 ## Notes
 - This is not an officially supported Tailscale configuration.

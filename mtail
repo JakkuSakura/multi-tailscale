@@ -1,0 +1,573 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+INSTANCE=""
+CONFIG_FILE=""
+FORCE="no"
+
+usage() {
+  cat <<'EOF'
+mtail: manage multiple Tailscale instances via network namespaces
+
+Usage:
+  mtail <command> [--instance NAME] [--config PATH] [--force]
+
+Commands:
+  init            Create a new instance config from template.
+  setup           Create netns, veth, routes, dns, firewall.
+  run             Run tailscaled in foreground for the instance.
+  up              Setup + run tailscaled in background.
+  down            Stop tailscaled and remove netns/routes/firewall.
+  login           Login the instance to a tailnet.
+  status          Show tailscale status for the instance.
+  list            List known instance configs.
+  show-config     Print resolved config.
+  logs            Tail instance log file.
+  install-systemd Install systemd template units (mtail@.service).
+  enable          Enable and start systemd units for instance.
+  disable         Stop and disable systemd units for instance.
+
+Options:
+  --instance NAME Instance name (required for most commands).
+  --config PATH   Config file path override.
+  --force         Overwrite config on init.
+EOF
+}
+
+require_root() {
+  if [[ "$(id -u)" -ne 0 ]]; then
+    echo "mtail: must run as root" >&2
+    exit 1
+  fi
+}
+
+cmd_exists() { command -v "$1" >/dev/null 2>&1; }
+
+parse_args() {
+  if [[ $# -lt 1 ]]; then
+    usage
+    exit 1
+  fi
+
+  COMMAND="$1"
+  shift
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --instance)
+        INSTANCE="$2"
+        shift 2
+        ;;
+      --config)
+        CONFIG_FILE="$2"
+        shift 2
+        ;;
+      --force)
+        FORCE="yes"
+        shift
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        echo "mtail: unknown option: $1" >&2
+        usage
+        exit 1
+        ;;
+    esac
+  done
+}
+
+instance_required() {
+  case "${COMMAND}" in
+    list|install-systemd)
+      return 0
+      ;;
+  esac
+
+  if [[ -z "${INSTANCE}" ]]; then
+    echo "mtail: --instance is required for ${COMMAND}" >&2
+    exit 1
+  fi
+}
+
+resolve_config() {
+  local default_dir="/etc/multi-tailnet/instances"
+  if [[ -z "${CONFIG_FILE}" ]]; then
+    CONFIG_FILE="${default_dir}/${INSTANCE}.conf"
+  fi
+
+  if [[ -f "${CONFIG_FILE}" ]]; then
+    # shellcheck disable=SC1090
+    source "${CONFIG_FILE}"
+  fi
+}
+
+sanitize_instance() {
+  local safe="${INSTANCE//[^a-zA-Z0-9]/}"
+  if [[ -n "${safe}" ]]; then
+    safe="${safe:0:16}"
+  fi
+  echo "${safe:-inst}"
+}
+
+apply_defaults() {
+  INSTANCE_SAFE="$(sanitize_instance)"
+
+  NS="${NS:-tailns-${INSTANCE_SAFE}}"
+  VETH_HOST="${VETH_HOST:-veth-${INSTANCE_SAFE}0}"
+  VETH_NS="${VETH_NS:-veth-${INSTANCE_SAFE}1}"
+  VETH_NET="${VETH_NET:-192.168.101.0/24}"
+  VETH_HOST_IP="${VETH_HOST_IP:-192.168.101.1/24}"
+  VETH_NS_IP="${VETH_NS_IP:-192.168.101.2/24}"
+
+  TAILSCALE_BIN="${TAILSCALE_BIN:-/usr/sbin/tailscaled}"
+  TAILSCALE_CLI="${TAILSCALE_CLI:-/usr/bin/tailscale}"
+
+  RUN_DIR="${RUN_DIR:-/run/mtail/${INSTANCE_SAFE}}"
+  STATE_DIR="${STATE_DIR:-/var/lib/mtail/${INSTANCE_SAFE}}"
+  SOCKET="${SOCKET:-${RUN_DIR}/tailscaled.sock}"
+  LOG_FILE="${LOG_FILE:-/var/log/mtail-${INSTANCE_SAFE}.log}"
+  TUN="${TUN:-tailscale0}"
+
+  HOST_IFACE="${HOST_IFACE:-eth0}"
+  WORK_SUBNETS=(${WORK_SUBNETS[@]:-"10.10.0.0/16" "10.20.0.0/16"})
+  FIREWALL="${FIREWALL:-auto}"
+  DNS_SERVERS=(${DNS_SERVERS[@]:-})
+}
+
+ensure_run_dir() {
+  mkdir -p "${RUN_DIR}"
+}
+
+detect_firewall() {
+  if [[ "${FIREWALL}" != "auto" ]]; then
+    return 0
+  fi
+
+  if cmd_exists ufw && ufw status 2>/dev/null | head -n1 | grep -qi "active"; then
+    FIREWALL="ufw"
+    return 0
+  fi
+
+  if cmd_exists nft; then
+    FIREWALL="nftables"
+    return 0
+  fi
+
+  if cmd_exists iptables; then
+    FIREWALL="iptables"
+    return 0
+  fi
+
+  echo "mtail: no supported firewall backend found (ufw, nftables, iptables)" >&2
+  exit 1
+}
+
+setup_netns() {
+  ip netns add "${NS}" 2>/dev/null || true
+  ip -n "${NS}" link set lo up
+
+  ip link add "${VETH_HOST}" type veth peer name "${VETH_NS}" 2>/dev/null || true
+  ip link set "${VETH_NS}" netns "${NS}"
+
+  ip addr add "${VETH_HOST_IP}" dev "${VETH_HOST}" 2>/dev/null || true
+  ip link set "${VETH_HOST}" up
+
+  ip -n "${NS}" addr add "${VETH_NS_IP}" dev "${VETH_NS}" 2>/dev/null || true
+  ip -n "${NS}" link set "${VETH_NS}" up
+
+  sysctl -w net.ipv4.ip_forward=1 >/dev/null
+  ip -n "${NS}" route add default via "${VETH_HOST_IP%/*}" 2>/dev/null || true
+}
+
+setup_routes() {
+  for subnet in "${WORK_SUBNETS[@]}"; do
+    ip route add "${subnet}" via "${VETH_NS_IP%/*}" 2>/dev/null || true
+  done
+}
+
+setup_dns() {
+  if [[ "${#DNS_SERVERS[@]}" -eq 0 ]]; then
+    return 0
+  fi
+
+  local netns_dir="/etc/netns/${NS}"
+  local resolv_file="${netns_dir}/resolv.conf"
+
+  ensure_run_dir
+  mkdir -p "${netns_dir}"
+  : > "${resolv_file}"
+  for dns in "${DNS_SERVERS[@]}"; do
+    echo "nameserver ${dns}" >> "${resolv_file}"
+  done
+  echo "options edns0 trust-ad" >> "${resolv_file}"
+  echo "mtail" > "${RUN_DIR}/dns-configured"
+}
+
+teardown_dns() {
+  if [[ ! -f "${RUN_DIR}/dns-configured" ]]; then
+    return 0
+  fi
+
+  local netns_dir="/etc/netns/${NS}"
+  local resolv_file="${netns_dir}/resolv.conf"
+
+  rm -f "${resolv_file}" "${RUN_DIR}/dns-configured"
+  rmdir "${netns_dir}" 2>/dev/null || true
+}
+
+setup_iptables() {
+  if ! cmd_exists iptables; then
+    echo "mtail: iptables not found. Install iptables or choose nftables/ufw." >&2
+    exit 1
+  fi
+
+  iptables -C FORWARD -i "${HOST_IFACE}" -o "${VETH_HOST}" -j ACCEPT 2>/dev/null \
+    || iptables -A FORWARD -i "${HOST_IFACE}" -o "${VETH_HOST}" -j ACCEPT
+  iptables -C FORWARD -o "${HOST_IFACE}" -i "${VETH_HOST}" -j ACCEPT 2>/dev/null \
+    || iptables -A FORWARD -o "${HOST_IFACE}" -i "${VETH_HOST}" -j ACCEPT
+
+  iptables -t nat -C POSTROUTING -s "${VETH_NET}" -o "${HOST_IFACE}" -j MASQUERADE 2>/dev/null \
+    || iptables -t nat -A POSTROUTING -s "${VETH_NET}" -o "${HOST_IFACE}" -j MASQUERADE
+
+  ip netns exec "${NS}" iptables -t nat -C POSTROUTING -s "${VETH_NET}" -o "${TUN}" -j MASQUERADE 2>/dev/null \
+    || ip netns exec "${NS}" iptables -t nat -A POSTROUTING -s "${VETH_NET}" -o "${TUN}" -j MASQUERADE
+}
+
+teardown_iptables() {
+  if ! cmd_exists iptables; then
+    return 0
+  fi
+
+  iptables -D FORWARD -i "${HOST_IFACE}" -o "${VETH_HOST}" -j ACCEPT 2>/dev/null || true
+  iptables -D FORWARD -o "${HOST_IFACE}" -i "${VETH_HOST}" -j ACCEPT 2>/dev/null || true
+  iptables -t nat -D POSTROUTING -s "${VETH_NET}" -o "${HOST_IFACE}" -j MASQUERADE 2>/dev/null || true
+
+  ip netns exec "${NS}" iptables -t nat -D POSTROUTING -s "${VETH_NET}" -o "${TUN}" -j MASQUERADE 2>/dev/null || true
+}
+
+nft_ensure_table_chain() {
+  local table="$1"
+  local chain="$2"
+  local type="$3"
+  local hook="$4"
+  local prio="$5"
+
+  nft list table inet "${table}" >/dev/null 2>&1 || nft add table inet "${table}"
+  if ! nft list chain inet "${table}" "${chain}" >/dev/null 2>&1; then
+    nft add chain inet "${table}" "${chain}" "{ type ${type} hook ${hook} priority ${prio}; }"
+  fi
+}
+
+nft_add_rule_once() {
+  local table="$1"
+  local chain="$2"
+  local rule="$3"
+
+  if ! nft list chain inet "${table}" "${chain}" | grep -F -- "${rule}" >/dev/null 2>&1; then
+    nft add rule inet "${table}" "${chain}" ${rule}
+  fi
+}
+
+setup_nftables() {
+  if ! cmd_exists nft; then
+    echo "mtail: nft not found. Install nftables or choose iptables/ufw." >&2
+    exit 1
+  fi
+
+  nft_ensure_table_chain "mtail" "forward" "filter" "forward" 0
+  nft_ensure_table_chain "mtail" "postrouting" "nat" "postrouting" 100
+
+  nft_add_rule_once "mtail" "forward" "iifname \"${HOST_IFACE}\" oifname \"${VETH_HOST}\" accept"
+  nft_add_rule_once "mtail" "forward" "iifname \"${VETH_HOST}\" oifname \"${HOST_IFACE}\" accept"
+  nft_add_rule_once "mtail" "postrouting" "ip saddr ${VETH_NET} oifname \"${HOST_IFACE}\" masquerade"
+
+  ip netns exec "${NS}" nft list table inet mtail >/dev/null 2>&1 || \
+    ip netns exec "${NS}" nft add table inet mtail
+  if ! ip netns exec "${NS}" nft list chain inet mtail postrouting >/dev/null 2>&1; then
+    ip netns exec "${NS}" nft add chain inet mtail postrouting "{ type nat hook postrouting priority 100; }"
+  fi
+  if ! ip netns exec "${NS}" nft list chain inet mtail postrouting | grep -F -- "ip saddr ${VETH_NET} oifname \"${TUN}\" masquerade" >/dev/null 2>&1; then
+    ip netns exec "${NS}" nft add rule inet mtail postrouting ip saddr "${VETH_NET}" oifname "${TUN}" masquerade
+  fi
+}
+
+teardown_nftables() {
+  if ! cmd_exists nft; then
+    return 0
+  fi
+
+  nft delete table inet mtail >/dev/null 2>&1 || true
+  ip netns exec "${NS}" nft delete table inet mtail >/dev/null 2>&1 || true
+}
+
+ufw_add_nat_block() {
+  local rules_file="/etc/ufw/before.rules"
+  local marker_begin="# mtail begin"
+  local marker_end="# mtail end"
+
+  if ! grep -qF "${marker_begin}" "${rules_file}"; then
+    awk -v begin="${marker_begin}" -v end="${marker_end}" -v net="${VETH_NET}" -v iface="${HOST_IFACE}" '
+      BEGIN { in_nat=0 }
+      $0 ~ /^\*nat/ { in_nat=1 }
+      in_nat && $0 ~ /^COMMIT/ {
+        print begin
+        print "-A POSTROUTING -s " net " -o " iface " -j MASQUERADE"
+        print end
+        in_nat=0
+      }
+      { print }
+    ' "${rules_file}" > "${rules_file}.tmp"
+    mv "${rules_file}.tmp" "${rules_file}"
+  fi
+}
+
+ufw_remove_nat_block() {
+  local rules_file="/etc/ufw/before.rules"
+  local marker_begin="# mtail begin"
+  local marker_end="# mtail end"
+
+  if grep -qF "${marker_begin}" "${rules_file}"; then
+    awk -v begin="${marker_begin}" -v end="${marker_end}" '
+      $0 == begin { skip=1; next }
+      $0 == end { skip=0; next }
+      !skip { print }
+    ' "${rules_file}" > "${rules_file}.tmp"
+    mv "${rules_file}.tmp" "${rules_file}"
+  fi
+}
+
+setup_ufw() {
+  if ! cmd_exists ufw; then
+    echo "mtail: ufw not found. Install ufw or choose nftables/iptables." >&2
+    exit 1
+  fi
+
+  ufw route allow in on "${HOST_IFACE}" out on "${VETH_HOST}" >/dev/null 2>&1 || true
+  ufw route allow in on "${VETH_HOST}" out on "${HOST_IFACE}" >/dev/null 2>&1 || true
+
+  ufw_add_nat_block
+  ufw reload >/dev/null 2>&1 || true
+}
+
+teardown_ufw() {
+  if ! cmd_exists ufw; then
+    return 0
+  fi
+
+  ufw --force delete route allow in on "${HOST_IFACE}" out on "${VETH_HOST}" >/dev/null 2>&1 || true
+  ufw --force delete route allow in on "${VETH_HOST}" out on "${HOST_IFACE}" >/dev/null 2>&1 || true
+
+  ufw_remove_nat_block
+  ufw reload >/dev/null 2>&1 || true
+}
+
+setup_firewall() {
+  ensure_run_dir
+  detect_firewall
+  echo "${FIREWALL}" > "${RUN_DIR}/firewall-backend"
+  case "${FIREWALL}" in
+    iptables) setup_iptables ;;
+    nftables) setup_nftables ;;
+    ufw) setup_ufw ;;
+    *)
+      echo "mtail: unsupported FIREWALL backend: ${FIREWALL}" >&2
+      exit 1
+      ;;
+  esac
+}
+
+teardown_firewall() {
+  if [[ -f "${RUN_DIR}/firewall-backend" ]]; then
+    FIREWALL="$(cat "${RUN_DIR}/firewall-backend")"
+  else
+    detect_firewall
+  fi
+
+  case "${FIREWALL}" in
+    iptables) teardown_iptables ;;
+    nftables) teardown_nftables ;;
+    ufw) teardown_ufw ;;
+    *) return 0 ;;
+  esac
+}
+
+start_tailscaled_background() {
+  mkdir -p "${STATE_DIR}"
+  ensure_run_dir
+  ip netns exec "${NS}" "${TAILSCALE_BIN}" \
+    -tun "${TUN}" \
+    --socket "${SOCKET}" \
+    --state "${STATE_DIR}/tstail.state" \
+    --statedir "${STATE_DIR}" \
+    >"${LOG_FILE}" 2>&1 &
+  echo $! > "${RUN_DIR}/tstail.pid"
+}
+
+run_tailscaled_foreground() {
+  mkdir -p "${STATE_DIR}"
+  ensure_run_dir
+  exec ip netns exec "${NS}" "${TAILSCALE_BIN}" \
+    -tun "${TUN}" \
+    --socket "${SOCKET}" \
+    --state "${STATE_DIR}/tstail.state" \
+    --statedir "${STATE_DIR}"
+}
+
+login_instance() {
+  "${TAILSCALE_CLI}" --socket "${SOCKET}" login --accept-routes
+}
+
+status_instance() {
+  "${TAILSCALE_CLI}" --socket "${SOCKET}" status
+}
+
+stop_tailscaled() {
+  if [[ -f "${RUN_DIR}/tstail.pid" ]]; then
+    kill "$(cat "${RUN_DIR}/tstail.pid")" 2>/dev/null || true
+    rm -f "${RUN_DIR}/tstail.pid"
+  fi
+}
+
+teardown() {
+  stop_tailscaled
+  teardown_firewall
+  teardown_dns
+  rm -f "${RUN_DIR}/firewall-backend" 2>/dev/null || true
+  for subnet in "${WORK_SUBNETS[@]}"; do
+    ip route del "${subnet}" 2>/dev/null || true
+  done
+  ip link del "${VETH_HOST}" 2>/dev/null || true
+  ip netns del "${NS}" 2>/dev/null || true
+  rmdir "${RUN_DIR}" 2>/dev/null || true
+}
+
+cmd_init() {
+  require_root
+  instance_required
+  local target="${CONFIG_FILE:-/etc/multi-tailnet/instances/${INSTANCE}.conf}"
+  local target_dir
+  target_dir="$(dirname "${target}")"
+  mkdir -p "${target_dir}"
+  if [[ -f "${target}" && "${FORCE}" != "yes" ]]; then
+    echo "mtail: config exists: ${target} (use --force to overwrite)" >&2
+    exit 1
+  fi
+  install -m 0644 "${SCRIPT_DIR}/config.sh" "${target}"
+  echo "mtail: created ${target}"
+}
+
+cmd_setup() {
+  require_root
+  setup_netns
+  setup_routes
+  setup_dns
+  setup_firewall
+}
+
+cmd_run() {
+  require_root
+  run_tailscaled_foreground
+}
+
+cmd_up() {
+  require_root
+  cmd_setup
+  start_tailscaled_background
+  echo "mtail: instance started. Run: mtail login --instance ${INSTANCE}"
+}
+
+cmd_down() {
+  require_root
+  teardown
+}
+
+cmd_login() {
+  require_root
+  login_instance
+}
+
+cmd_status() {
+  require_root
+  status_instance
+}
+
+cmd_list() {
+  local dir="/etc/multi-tailnet/instances"
+  if [[ ! -d "${dir}" ]]; then
+    return 0
+  fi
+  ls -1 "${dir}" | sed 's/\.conf$//'
+}
+
+cmd_show_config() {
+  if [[ ! -f "${CONFIG_FILE}" ]]; then
+    echo "mtail: config not found: ${CONFIG_FILE}" >&2
+    exit 1
+  fi
+  cat "${CONFIG_FILE}"
+}
+
+cmd_logs() {
+  require_root
+  if [[ ! -f "${LOG_FILE}" ]]; then
+    echo "mtail: log not found: ${LOG_FILE}" >&2
+    exit 1
+  fi
+  tail -n 200 "${LOG_FILE}"
+}
+
+cmd_install_systemd() {
+  require_root
+  local systemd_dir="/etc/systemd/system"
+  install -m 0644 "${SCRIPT_DIR}/systemd/mtail-setup@.service" "${systemd_dir}/mtail-setup@.service"
+  install -m 0644 "${SCRIPT_DIR}/systemd/mtail@.service" "${systemd_dir}/mtail@.service"
+  systemctl daemon-reload
+  echo "mtail: installed systemd units"
+}
+
+cmd_enable() {
+  require_root
+  systemctl enable --now "mtail-setup@${INSTANCE}.service"
+  systemctl enable --now "mtail@${INSTANCE}.service"
+}
+
+cmd_disable() {
+  require_root
+  systemctl disable --now "mtail@${INSTANCE}.service" || true
+  systemctl disable --now "mtail-setup@${INSTANCE}.service" || true
+}
+
+main() {
+  parse_args "$@"
+  instance_required
+  resolve_config
+  apply_defaults
+
+  case "${COMMAND}" in
+    init) cmd_init ;;
+    setup) cmd_setup ;;
+    run) cmd_run ;;
+    up) cmd_up ;;
+    down) cmd_down ;;
+    login) cmd_login ;;
+    status) cmd_status ;;
+    list) cmd_list ;;
+    show-config) cmd_show_config ;;
+    logs) cmd_logs ;;
+    install-systemd) cmd_install_systemd ;;
+    enable) cmd_enable ;;
+    disable) cmd_disable ;;
+    *)
+      echo "mtail: unknown command: ${COMMAND}" >&2
+      usage
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"

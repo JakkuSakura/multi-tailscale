@@ -1,6 +1,8 @@
-# multi-tailnet config
+# mtail config
 #
 # Copy and edit this file, or override values via environment variables.
+# For multiple instances, copy to /etc/multi-tailnet/instances/<name>.conf
+# and use mtail with --instance <name>.
 
 # Namespace and veth configuration
 NS="tailns"

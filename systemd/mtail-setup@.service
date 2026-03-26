@@ -1,11 +1,11 @@
 [Unit]
-Description=Multi-tailnet setup (netns, routes, firewall)
+Description=mtail setup (netns, routes, firewall) (%i)
 Wants=network-online.target
 After=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/multi-tailnet.sh setup
+ExecStart=/usr/local/bin/mtail setup --instance %i
 RemainAfterExit=yes
 
 [Install]
