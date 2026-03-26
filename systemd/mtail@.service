@@ -1,7 +1,5 @@
 [Unit]
 Description=mtail tailscaled (%i)
-Requires=mtail-setup@%i.service
-After=mtail-setup@%i.service
 
 [Service]
 Type=simple

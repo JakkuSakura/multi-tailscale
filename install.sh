@@ -30,7 +30,6 @@ install -d "${CONFIG_DIR}"
 install -m 0644 "${SCRIPT_DIR}/config.sh" "${CONFIG_DIR}/config.sh"
 install -d "${INSTANCES_DIR}"
 
-install -m 0644 "${SCRIPT_DIR}/systemd/mtail-setup@.service" "${SYSTEMD_DIR}/mtail-setup@.service"
 install -m 0644 "${SCRIPT_DIR}/systemd/mtail@.service" "${SYSTEMD_DIR}/mtail@.service"
 
 systemctl daemon-reload
@@ -40,7 +39,6 @@ Installed:
 - ${INSTALL_BIN}
 - ${CONFIG_DIR}/config.sh
 - ${INSTANCES_DIR}/
-- ${SYSTEMD_DIR}/mtail-setup@.service
 - ${SYSTEMD_DIR}/mtail@.service
 
 Next steps:

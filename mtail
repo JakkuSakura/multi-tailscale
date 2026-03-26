@@ -26,7 +26,7 @@ Commands:
   list            List known instance configs.
   show-config     Print resolved config.
   logs            Tail instance log file.
-  install-systemd Install systemd template units (mtail@.service).
+  install-systemd Install systemd unit via install.sh (repo only).
   enable          Enable and start systemd units for instance.
   disable         Stop and disable systemd units for instance.
 
@@ -487,7 +487,7 @@ cmd_run() {
 
 cmd_up() {
   require_root
-  systemctl enable --now "mtail-setup@${INSTANCE}.service"
+  cmd_setup
   systemctl enable --now "mtail@${INSTANCE}.service"
   echo "mtail: instance started. Run: mtail login ${INSTANCE}"
 }
@@ -495,7 +495,7 @@ cmd_up() {
 cmd_down() {
   require_root
   systemctl stop "mtail@${INSTANCE}.service" || true
-  systemctl stop "mtail-setup@${INSTANCE}.service" || true
+  teardown
 }
 
 cmd_login() {
@@ -535,23 +535,24 @@ cmd_logs() {
 
 cmd_install_systemd() {
   require_root
-  local systemd_dir="/etc/systemd/system"
-  install -m 0644 "${SCRIPT_DIR}/systemd/mtail-setup@.service" "${systemd_dir}/mtail-setup@.service"
-  install -m 0644 "${SCRIPT_DIR}/systemd/mtail@.service" "${systemd_dir}/mtail@.service"
-  systemctl daemon-reload
-  echo "mtail: installed systemd units"
+  local installer="${SCRIPT_DIR}/install.sh"
+  if [[ ! -x "${installer}" ]]; then
+    echo "mtail: install.sh not found next to mtail. Run install.sh from the repo." >&2
+    exit 1
+  fi
+  "${installer}"
 }
 
 cmd_enable() {
   require_root
-  systemctl enable --now "mtail-setup@${INSTANCE}.service"
+  cmd_setup
   systemctl enable --now "mtail@${INSTANCE}.service"
 }
 
 cmd_disable() {
   require_root
   systemctl disable --now "mtail@${INSTANCE}.service" || true
-  systemctl disable --now "mtail-setup@${INSTANCE}.service" || true
+  teardown
 }
 
 main() {

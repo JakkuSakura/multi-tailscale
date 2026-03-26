@@ -45,8 +45,9 @@ To stop and clean up:
 sudo ./mtail down work
 ```
 
-`mtail up/down` use systemd template units under the hood. If your host
-does not use systemd, use the manual `setup/run/down` commands instead.
+`mtail up/down` run setup/cleanup directly and start/stop the systemd
+`mtail@.service` unit. If your host does not use systemd, use the manual
+`setup/run/down` commands instead.
 
 ## systemd (recommended)
 Helper install script:
@@ -54,19 +55,7 @@ Helper install script:
 sudo ./install.sh
 ```
 
-Or manually:
-```bash
-sudo install -m 0755 mtail /usr/local/bin/mtail
-sudo install -d /etc/multi-tailnet
-sudo install -m 0644 config.sh /etc/multi-tailnet/config.sh
-```
-
-Install units:
-```bash
-sudo install -m 0644 systemd/mtail-setup@.service /etc/systemd/system/mtail-setup@.service
-sudo install -m 0644 systemd/mtail@.service /etc/systemd/system/mtail@.service
-sudo systemctl daemon-reload
-```
+`install.sh` installs the CLI, default config, and systemd unit.
 
 ### Two equal instances (quickstart)
 This runs two independent tailnets (`work` and `personal`) with identical UX.
