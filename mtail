@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 INSTANCE=""
 CONFIG_FILE=""
 FORCE="no"
+PURGE="no"
 
 usage() {
   cat <<'EOF'
@@ -26,14 +27,14 @@ Commands:
   list            List known instance configs.
   show-config     Print resolved config.
   logs            Tail instance log file.
-  install        Self-install CLI, config template, and systemd unit.
-  enable          Enable and start systemd units for instance.
-  disable         Stop and disable systemd units for instance.
+  install         Self-install CLI, config template, and systemd unit.
+  uninstall       Remove CLI and systemd unit (configs kept by default).
 
 Options:
   --instance NAME Instance name (required for most commands).
   --config PATH   Config file path override.
   --force         Overwrite config on create.
+  --purge         Remove /etc/multi-tailnet on uninstall.
 EOF
 }
 
@@ -70,6 +71,10 @@ parse_args() {
         FORCE="yes"
         shift
         ;;
+      --purge)
+        PURGE="yes"
+        shift
+        ;;
       -h|--help)
         usage
         exit 0
@@ -94,7 +99,7 @@ parse_args() {
 
 instance_required() {
   case "${COMMAND}" in
-    list|install-systemd)
+    list|install|uninstall)
       return 0
       ;;
   esac
@@ -577,16 +582,47 @@ Next steps:
 EOF_MSG
 }
 
-cmd_enable() {
+cmd_uninstall() {
   require_root
-  cmd_setup
-  systemctl enable --now "mtail@${INSTANCE}.service"
-}
+  local install_bin="/usr/local/bin/mtail"
+  local config_dir="/etc/multi-tailnet"
+  local instances_dir="${config_dir}/instances"
+  local systemd_unit="/etc/systemd/system/mtail@.service"
 
-cmd_disable() {
-  require_root
-  systemctl disable --now "mtail@${INSTANCE}.service" || true
-  teardown
+  cat <<EOF_WARN
+This will remove:
+- ${install_bin}
+- ${systemd_unit}
+
+Configs will be kept unless --purge is set.
+Proceed? [y/N]
+EOF_WARN
+  read -r reply
+  if [[ "${reply}" != "y" && "${reply}" != "Y" ]]; then
+    echo "Aborted."
+    exit 1
+  fi
+
+  if cmd_exists systemctl; then
+    if [[ -d "${instances_dir}" ]]; then
+      for cfg in "${instances_dir}"/*.conf; do
+        [[ -e "${cfg}" ]] || continue
+        local name
+        name="$(basename "${cfg}" .conf)"
+        systemctl stop "mtail@${name}.service" >/dev/null 2>&1 || true
+      done
+    fi
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+
+  rm -f "${systemd_unit}"
+  rm -f "${install_bin}"
+
+  if [[ "${PURGE}" == "yes" ]]; then
+    rm -rf "${config_dir}"
+  fi
+
+  echo "mtail: uninstalled"
 }
 
 main() {
@@ -607,8 +643,7 @@ main() {
     show-config) cmd_show_config ;;
     logs) cmd_logs ;;
     install) cmd_install ;;
-    enable) cmd_enable ;;
-    disable) cmd_disable ;;
+    uninstall) cmd_uninstall ;;
     *)
       echo "mtail: unknown command: ${COMMAND}" >&2
       usage
