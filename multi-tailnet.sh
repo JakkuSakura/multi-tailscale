@@ -27,11 +27,16 @@ TUN="${TUN:-tailscale0}"
 HOST_IFACE="${HOST_IFACE:-eth0}"
 WORK_SUBNETS=(${WORK_SUBNETS[@]:-"10.10.0.0/16" "10.20.0.0/16"})
 FIREWALL="${FIREWALL:-auto}"
+DNS_SERVERS=(${DNS_SERVERS[@]:-})
 
 log() { echo "[multi-tailnet] $*"; }
 err() { echo "[multi-tailnet] ERROR: $*" >&2; }
 
 cmd_exists() { command -v "$1" >/dev/null 2>&1; }
+
+ensure_run_dir() {
+  mkdir -p /run/tstail
+}
 
 require_root() {
   if [[ "$(id -u)" -ne 0 ]]; then
@@ -87,6 +92,36 @@ setup_routes() {
   done
 }
 
+setup_dns() {
+  if [[ "${#DNS_SERVERS[@]}" -eq 0 ]]; then
+    return 0
+  fi
+
+  local netns_dir="/etc/netns/${NS}"
+  local resolv_file="${netns_dir}/resolv.conf"
+
+  ensure_run_dir
+  mkdir -p "${netns_dir}"
+  : > "${resolv_file}"
+  for dns in "${DNS_SERVERS[@]}"; do
+    echo "nameserver ${dns}" >> "${resolv_file}"
+  done
+  echo "options edns0 trust-ad" >> "${resolv_file}"
+  echo "multi-tailnet" > /run/tstail/dns-configured
+}
+
+teardown_dns() {
+  if [[ ! -f /run/tstail/dns-configured ]]; then
+    return 0
+  fi
+
+  local netns_dir="/etc/netns/${NS}"
+  local resolv_file="${netns_dir}/resolv.conf"
+
+  rm -f "${resolv_file}" /run/tstail/dns-configured
+  rmdir "${netns_dir}" 2>/dev/null || true
+}
+
 setup_iptables() {
   if ! cmd_exists iptables; then
     err "iptables not found. Install iptables or choose nftables/ufw."
@@ -103,6 +138,18 @@ setup_iptables() {
 
   ip netns exec "${NS}" iptables -t nat -C POSTROUTING -s "${VETH_NET}" -o "${TUN}" -j MASQUERADE 2>/dev/null \
     || ip netns exec "${NS}" iptables -t nat -A POSTROUTING -s "${VETH_NET}" -o "${TUN}" -j MASQUERADE
+}
+
+teardown_iptables() {
+  if ! cmd_exists iptables; then
+    return 0
+  fi
+
+  iptables -D FORWARD -i "${HOST_IFACE}" -o "${VETH_HOST}" -j ACCEPT 2>/dev/null || true
+  iptables -D FORWARD -o "${HOST_IFACE}" -i "${VETH_HOST}" -j ACCEPT 2>/dev/null || true
+  iptables -t nat -D POSTROUTING -s "${VETH_NET}" -o "${HOST_IFACE}" -j MASQUERADE 2>/dev/null || true
+
+  ip netns exec "${NS}" iptables -t nat -D POSTROUTING -s "${VETH_NET}" -o "${TUN}" -j MASQUERADE 2>/dev/null || true
 }
 
 nft_ensure_table_chain() {
@@ -150,6 +197,15 @@ setup_nftables() {
   if ! ip netns exec "${NS}" nft list chain inet multi_tailnet postrouting | grep -F -- "ip saddr ${VETH_NET} oifname \"${TUN}\" masquerade" >/dev/null 2>&1; then
     ip netns exec "${NS}" nft add rule inet multi_tailnet postrouting ip saddr "${VETH_NET}" oifname "${TUN}" masquerade
   fi
+}
+
+teardown_nftables() {
+  if ! cmd_exists nft; then
+    return 0
+  fi
+
+  nft delete table inet multi_tailnet >/dev/null 2>&1 || true
+  ip netns exec "${NS}" nft delete table inet multi_tailnet >/dev/null 2>&1 || true
 }
 
 ufw_add_nat_block() {
@@ -215,7 +271,9 @@ teardown_ufw() {
 }
 
 setup_firewall() {
+  ensure_run_dir
   detect_firewall
+  echo "${FIREWALL}" > /run/tstail/firewall-backend
   case "${FIREWALL}" in
     iptables)
       setup_iptables
@@ -229,6 +287,29 @@ setup_firewall() {
     *)
       err "Unsupported FIREWALL backend: ${FIREWALL}"
       exit 1
+      ;;
+  esac
+}
+
+teardown_firewall() {
+  if [[ -f /run/tstail/firewall-backend ]]; then
+    FIREWALL="$(cat /run/tstail/firewall-backend)"
+  else
+    detect_firewall
+  fi
+
+  case "${FIREWALL}" in
+    iptables)
+      teardown_iptables
+      ;;
+    nftables)
+      teardown_nftables
+      ;;
+    ufw)
+      teardown_ufw
+      ;;
+    *)
+      return 0
       ;;
   esac
 }
@@ -266,15 +347,14 @@ stop_tailscaled() {
 
 teardown() {
   stop_tailscaled
+  teardown_firewall
+  teardown_dns
+  rm -f /run/tstail/firewall-backend 2>/dev/null || true
   for subnet in "${WORK_SUBNETS[@]}"; do
     ip route del "${subnet}" 2>/dev/null || true
   done
   ip link del "${VETH_HOST}" 2>/dev/null || true
   ip netns del "${NS}" 2>/dev/null || true
-
-  if [[ "${FIREWALL}" == "ufw" || "${FIREWALL}" == "auto" ]]; then
-    teardown_ufw
-  fi
 }
 
 usage() {
@@ -287,6 +367,7 @@ main() {
     setup)
       setup_netns
       setup_routes
+      setup_dns
       setup_firewall
       ;;
     run)
@@ -295,6 +376,7 @@ main() {
     up)
       setup_netns
       setup_routes
+      setup_dns
       setup_firewall
       start_tailscaled_background
       log "Second tailscaled started. Run: $0 login"

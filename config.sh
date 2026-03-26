@@ -25,5 +25,8 @@ HOST_IFACE="eth0"
 # Subnets you want to reach via the SECOND tailnet (space-separated)
 WORK_SUBNETS=("10.10.0.0/16" "10.20.0.0/16")
 
+# Optional: per-namespace DNS servers (space-separated). Leave empty to skip.
+DNS_SERVERS=()
+
 # Firewall backend: auto | iptables | nftables | ufw
 FIREWALL="auto"

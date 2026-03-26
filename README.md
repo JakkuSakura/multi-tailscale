@@ -7,6 +7,7 @@ Run a second Tailscale daemon on Linux in a separate network namespace so one ma
 - Starts a second `tailscaled` inside the netns with separate state/socket
 - Routes selected subnets from the second tailnet through the namespace
 - Adds NAT and forwarding rules via iptables, nftables, or ufw
+- Optional per-namespace DNS config
 
 ## Requirements
 - Linux host
@@ -20,6 +21,7 @@ Edit `config.sh`:
 - `HOST_IFACE` (your Internet-facing interface)
 - `WORK_SUBNETS` (subnets you need via the second tailnet)
 - `FIREWALL` (`auto`, `iptables`, `nftables`, `ufw`)
+- `DNS_SERVERS` (optional; if set, writes `/etc/netns/<ns>/resolv.conf`)
 - Optional: veth IPs and namespace name
 
 You can also override the config file path:
@@ -49,7 +51,12 @@ sudo ./multi-tailnet.sh down
 ```
 
 ## systemd (recommended)
-Install script + config:
+Helper install script:
+```bash
+sudo ./install.sh
+```
+
+Or manually:
 ```bash
 sudo install -m 0755 multi-tailnet.sh /usr/local/bin/multi-tailnet.sh
 sudo install -d /etc/multi-tailnet
