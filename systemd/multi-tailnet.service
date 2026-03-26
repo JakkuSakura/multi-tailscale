@@ -1,0 +1,13 @@
+[Unit]
+Description=Multi-tailnet second tailscaled
+Requires=multi-tailnet-setup.service
+After=multi-tailnet-setup.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/multi-tailnet.sh run
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
