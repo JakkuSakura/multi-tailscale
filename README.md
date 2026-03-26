@@ -50,17 +50,15 @@ sudo ./mtail down work
 `setup/run/down` commands instead.
 
 ## systemd (recommended)
-Helper install script:
+Self-install:
 ```bash
-sudo ./install.sh
+sudo ./mtail install
 ```
-
-`install.sh` installs the CLI, default config, and systemd unit.
 
 ### Two equal instances (quickstart)
 This runs two independent tailnets (`work` and `personal`) with identical UX.
 ```bash
-sudo ./install.sh
+sudo ./mtail install
 sudo mtail create work
 sudo mtail create personal
 sudo $EDITOR /etc/multi-tailnet/instances/work.conf

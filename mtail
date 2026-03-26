@@ -26,7 +26,7 @@ Commands:
   list            List known instance configs.
   show-config     Print resolved config.
   logs            Tail instance log file.
-  install-systemd Install systemd unit via install.sh (repo only).
+  install        Self-install CLI, config template, and systemd unit.
   enable          Enable and start systemd units for instance.
   disable         Stop and disable systemd units for instance.
 
@@ -533,14 +533,48 @@ cmd_logs() {
   tail -n 200 "${LOG_FILE}"
 }
 
-cmd_install_systemd() {
+cmd_install() {
   require_root
-  local installer="${SCRIPT_DIR}/install.sh"
-  if [[ ! -x "${installer}" ]]; then
-    echo "mtail: install.sh not found next to mtail. Run install.sh from the repo." >&2
-    exit 1
+  local install_bin="/usr/local/bin/mtail"
+  local config_dir="/etc/multi-tailnet"
+  local instances_dir="${config_dir}/instances"
+  local systemd_dir="/etc/systemd/system"
+
+  if command -v mtail >/dev/null 2>&1; then
+    cat <<EOF_WARN
+Warning: "mtail" already exists in PATH.
+This installer will overwrite: ${install_bin}
+Proceed? [y/N]
+EOF_WARN
+    read -r reply
+    if [[ "${reply}" != "y" && "${reply}" != "Y" ]]; then
+      echo "Aborted."
+      exit 1
+    fi
   fi
-  "${installer}"
+
+  install -m 0755 "${SCRIPT_DIR}/mtail" "${install_bin}"
+  install -d "${config_dir}"
+  install -m 0644 "${SCRIPT_DIR}/config.sh" "${config_dir}/config.sh"
+  install -d "${instances_dir}"
+  install -m 0644 "${SCRIPT_DIR}/systemd/mtail@.service" "${systemd_dir}/mtail@.service"
+  systemctl daemon-reload
+
+  cat <<EOF_MSG
+Installed:
+- ${install_bin}
+- ${config_dir}/config.sh
+- ${instances_dir}/
+- ${systemd_dir}/mtail@.service
+
+Next steps:
+1) Create instance config (replace work):
+  sudo ${install_bin} create work
+2) Start:
+  sudo ${install_bin} up work
+3) Login:
+  sudo ${install_bin} login work
+EOF_MSG
 }
 
 cmd_enable() {
@@ -572,7 +606,7 @@ main() {
     list) cmd_list ;;
     show-config) cmd_show_config ;;
     logs) cmd_logs ;;
-    install-systemd) cmd_install_systemd ;;
+    install) cmd_install ;;
     enable) cmd_enable ;;
     disable) cmd_disable ;;
     *)
